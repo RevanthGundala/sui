@@ -104,6 +104,13 @@ export const SuiCallArg = union([
 		initialSharedVersion: string(),
 		mutable: boolean(),
 	}),
+	object({
+		type: literal('object'),
+		objectType: literal('receiving'),
+		objectId: ObjectId,
+		version: SequenceNumber,
+		digest: ObjectDigest,
+	}),
 ]);
 export type SuiCallArg = Infer<typeof SuiCallArg>;
 

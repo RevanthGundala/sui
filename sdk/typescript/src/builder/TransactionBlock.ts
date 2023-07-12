@@ -86,6 +86,18 @@ function createTransactionResult(index: number): TransactionResult {
 	}) as TransactionResult;
 }
 
+function isReceivingType(normalizedType: SuiMoveNormalizedType): boolean {
+	const tag = extractStructTag(normalizedType);
+	if (tag) {
+		return (
+			tag.Struct.address === '0x2' &&
+			tag.Struct.module === 'transfer' &&
+			tag.Struct.name === 'Receiving'
+		);
+	}
+	return false;
+}
+
 function expectClient(options: BuildOptions): JsonRpcProvider | SuiClient {
 	if (!options.client && !options.provider) {
 		throw new Error(
@@ -284,11 +296,31 @@ export class TransactionBlock {
 	}
 
 	/**
+	 * Add a new object input to the transaction.
+	 */
+	receiving(value: ObjectId | ObjectCallArg) {
+		const id = getIdFromCallArg(value);
+		// deduplicate
+		const inserted = this.#blockData.inputs.find(
+			(i) => i.type === 'object' && id === getIdFromCallArg(i.value),
+		);
+		return inserted ?? this.#input('object', value);
+	}
+
+	/**
 	 * Add a new object input to the transaction using the fully-resolved object reference.
 	 * If you only have an object ID, use `builder.object(id)` instead.
 	 */
 	objectRef(...args: Parameters<(typeof Inputs)['ObjectRef']>) {
 		return this.object(Inputs.ObjectRef(...args));
+	}
+
+	/**
+	 * Add a new receiving input to the transaction using the fully-resolved object reference.
+	 * If you only have an object ID, use `builder.receiving(id)` instead.
+	 */
+	receivingRef(...args: Parameters<(typeof Inputs)['ReceivingRef']>) {
+		return this.receiving(Inputs.ReceivingRef(...args));
 	}
 
 	/**
@@ -684,6 +716,8 @@ export class TransactionBlock {
 						initialSharedVersion,
 						mutable,
 					});
+				} else if (normalizedType && isReceivingType(normalizedType)) {
+					input.value = Inputs.ReceivingRef(getObjectReference(object)!);
 				} else {
 					input.value = Inputs.ObjectRef(getObjectReference(object)!);
 				}
