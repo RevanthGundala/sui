@@ -340,6 +340,7 @@ impl ObjectStore for CheckpointData {
 }
 
 // Per checkpoint indexing
+#[derive(Debug)]
 pub struct TemporaryCheckpointStore {
     pub checkpoint: Checkpoint,
     pub transactions: Vec<Transaction>,

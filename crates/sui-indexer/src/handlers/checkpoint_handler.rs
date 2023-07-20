@@ -1,14 +1,15 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
-
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
 use fastcrypto::traits::ToFromBytes;
 use futures::future::join_all;
+use futures::stream::FuturesOrdered;
 use futures::FutureExt;
+use futures::StreamExt;
 use jsonrpsee::http_client::HttpClient;
 use move_core_types::ident_str;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use tap::tap::TapFallible;
 use tokio::sync::{
     mpsc::{self, Receiver, Sender},
     Mutex,
@@ -29,7 +30,6 @@ use sui_types::committee::EpochId;
 use sui_types::messages_checkpoint::{CheckpointCommitment, CheckpointSequenceNumber};
 use sui_types::sui_system_state::sui_system_state_summary::SuiSystemStateSummary;
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemStateTrait};
-use sui_types::transaction::SenderSignedData;
 use sui_types::SUI_SYSTEM_ADDRESS;
 
 use crate::errors::IndexerError;
@@ -49,6 +49,7 @@ use crate::IndexerConfig;
 
 const MAX_PARALLEL_DOWNLOADS: usize = 24;
 const DOWNLOAD_RETRY_INTERVAL_IN_SECS: u64 = 10;
+const CHECKPOINT_INDEX_RETRY_INTERVAL_IN_SECS: u64 = 10;
 const DB_COMMIT_RETRY_INTERVAL_IN_MILLIS: u64 = 100;
 const MULTI_GET_CHUNK_SIZE: usize = 50;
 const CHECKPOINT_QUEUE_LIMIT: usize = 24;
@@ -58,7 +59,7 @@ const EPOCH_QUEUE_LIMIT: usize = 2;
 pub struct CheckpointHandler<S> {
     state: S,
     http_client: HttpClient,
-    subscription_handler: Arc<SubscriptionHandler>,
+    // subscription_handler: Arc<SubscriptionHandler>,
     metrics: IndexerMetrics,
     config: IndexerConfig,
     checkpoint_sender: Arc<Mutex<Sender<TemporaryCheckpointStore>>>,
@@ -74,7 +75,7 @@ where
     pub fn new(
         state: S,
         http_client: HttpClient,
-        subscription_handler: Arc<SubscriptionHandler>,
+        _subscription_handler: Arc<SubscriptionHandler>,
         metrics: IndexerMetrics,
         config: &IndexerConfig,
     ) -> Self {
@@ -83,7 +84,7 @@ where
         Self {
             state,
             http_client,
-            subscription_handler,
+            // subscription_handler,
             metrics,
             config: config.clone(),
             checkpoint_sender: Arc::new(Mutex::new(checkpoint_sender)),
@@ -95,12 +96,13 @@ where
 
     pub fn spawn(self) -> JoinHandle<()> {
         info!("Indexer checkpoint handler started...");
+        let (tx, rx) = tokio::sync::mpsc::channel(10000);
         let download_handler = self.clone();
         spawn_monitored_task!(async move {
             let mut checkpoint_download_index_res =
-                download_handler.start_download_and_index().await;
+                download_handler.start_download_and_index(tx.clone()).await;
             while let Err(e) = &checkpoint_download_index_res {
-                warn!(
+                error!(
                     "Indexer checkpoint download & index failed with error: {:?}, retrying after {:?} secs...",
                     e, DOWNLOAD_RETRY_INTERVAL_IN_SECS
                 );
@@ -108,7 +110,29 @@ where
                     DOWNLOAD_RETRY_INTERVAL_IN_SECS,
                 ))
                 .await;
-                checkpoint_download_index_res = download_handler.start_download_and_index().await;
+                checkpoint_download_index_res =
+                    download_handler.start_download_and_index(tx.clone()).await;
+            }
+        });
+        let mut checkpoint_processor = CheckpointProcessor {
+            state: self.state.clone(),
+            metrics: self.metrics.clone(),
+            epoch_sender: self.epoch_sender.clone(),
+            checkpoint_sender: self.checkpoint_sender.clone(),
+            rx,
+        };
+        spawn_monitored_task!(async move {
+            let mut res = checkpoint_processor.run().await;
+            while let Err(e) = &res {
+                warn!(
+                    "Indexer checkpoint data processing failed with error: {:?}, retrying after {:?} secs...",
+                    e, CHECKPOINT_INDEX_RETRY_INTERVAL_IN_SECS
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    CHECKPOINT_INDEX_RETRY_INTERVAL_IN_SECS,
+                ))
+                .await;
+                res = checkpoint_processor.run().await;
             }
         });
 
@@ -145,7 +169,10 @@ where
         })
     }
 
-    async fn start_download_and_index(&self) -> Result<(), IndexerError> {
+    async fn start_download_and_index(
+        &self,
+        tx: Sender<CheckpointData>,
+    ) -> Result<(), IndexerError> {
         info!("Indexer checkpoint download & index task started...");
         // NOTE: important not to cast i64 to u64 here,
         // because -1 will be returned when checkpoints table is empty.
@@ -156,123 +183,26 @@ where
         let mut next_cursor_sequence_number = last_seq_from_db + 1;
         // NOTE: we will download checkpoints in parallel, but we will commit them sequentially.
         // We will start with MAX_PARALLEL_DOWNLOADS, and adjust if no more checkpoints are available.
-        let mut current_parallel_downloads = MAX_PARALLEL_DOWNLOADS;
+        let current_parallel_downloads = MAX_PARALLEL_DOWNLOADS;
         loop {
-            let download_futures = (next_cursor_sequence_number
-                ..next_cursor_sequence_number + current_parallel_downloads as i64)
-                .map(|seq_num| self.download_checkpoint_data(seq_num as u64));
-            let download_results = join_all(download_futures).await;
-            let mut downloaded_checkpoints = vec![];
+            let mut download_futures = FuturesOrdered::new();
+            for seq_num in next_cursor_sequence_number
+                ..next_cursor_sequence_number + current_parallel_downloads as i64
+            {
+                download_futures.push_back(self.download_checkpoint_data(seq_num as u64));
+            }
             // NOTE: Push sequentially and if one of the downloads failed,
             // we will discard all following checkpoints and retry, to avoid messing up the DB commit order.
-            for download_result in download_results {
-                if let Ok(checkpoint) = download_result {
-                    downloaded_checkpoints.push(checkpoint);
-                } else {
-                    if let Err(IndexerError::UnexpectedFullnodeResponseError(fn_e)) =
-                        download_result
-                    {
-                        warn!(
-                            "Unexpected response from fullnode for checkpoints: {}",
-                            fn_e
-                        );
-                    } else if let Err(IndexerError::FullNodeReadingError(fn_e)) = download_result {
-                        warn!("Fullnode reading error for checkpoints {}: {}. It can be transient or due to rate limiting.", next_cursor_sequence_number, fn_e);
-                    } else {
-                        warn!("Error downloading checkpoints: {:?}", download_result);
+            while let Some(res) = download_futures.next().await {
+                match res {
+                    Ok(checkpoint) => {
+                        tx.send(checkpoint)
+                            .await
+                            .expect("Send to checkpoint channel should not fail");
+                        next_cursor_sequence_number += 1;
                     }
-                    break;
+                    Err(e) => return Err(e),
                 }
-            }
-
-            next_cursor_sequence_number += downloaded_checkpoints.len() as i64;
-            // NOTE: with this line, we can make sure that:
-            // - when indexer is way behind and catching up, we download MAX_PARALLEL_DOWNLOADS checkpoints in parallel;
-            // - when indexer is up to date, we download at least one checkpoint at a time.
-            current_parallel_downloads =
-                std::cmp::min(downloaded_checkpoints.len() + 1, MAX_PARALLEL_DOWNLOADS);
-            if downloaded_checkpoints.is_empty() {
-                warn!(
-                    "No checkpoints were downloaded for sequence number {}, retrying...",
-                    next_cursor_sequence_number
-                );
-                continue;
-            }
-
-            // Index checkpoint data
-            let index_timer = self.metrics.checkpoint_index_latency.start_timer();
-            let indexed_checkpoint_epoch_vec = join_all(downloaded_checkpoints.iter().map(
-                |downloaded_checkpoint| async {
-                    self.index_checkpoint_and_epoch(downloaded_checkpoint).await
-                },
-            ))
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, IndexerError>>()
-            .map_err(|e| {
-                error!(
-                    "Failed to index checkpoints {:?} with error: {}",
-                    downloaded_checkpoints,
-                    e.to_string()
-                );
-                e
-            })?;
-            let (indexed_checkpoints, indexed_epochs): (Vec<_>, Vec<_>) =
-                indexed_checkpoint_epoch_vec.into_iter().unzip();
-            index_timer.stop_and_record();
-
-            for epoch in indexed_epochs.into_iter().flatten() {
-                // commit first epoch immediately, send other epochs to channel to be committed later.
-                if epoch.last_epoch.is_none() {
-                    let epoch_db_guard = self.metrics.epoch_db_commit_latency.start_timer();
-                    info!("Persisting first epoch...");
-                    let mut persist_first_epoch_res = self.state.persist_epoch(&epoch).await;
-                    while persist_first_epoch_res.is_err() {
-                        warn!("Failed to persist first epoch, retrying...");
-                        persist_first_epoch_res = self.state.persist_epoch(&epoch).await;
-                    }
-                    epoch_db_guard.stop_and_record();
-                    self.metrics.total_epoch_committed.inc();
-                    info!("Persisted first epoch");
-                } else {
-                    let epoch_sender_guard = self.epoch_sender.lock().await;
-                    // NOTE: when the channel is full, epoch_sender_guard will wait until the channel has space.
-                    epoch_sender_guard.send(epoch).await.map_err(|e| {
-                        error!(
-                            "Failed to send indexed epoch to epoch commit handler with error {}",
-                            e.to_string()
-                        );
-                        IndexerError::MpscChannelError(e.to_string())
-                    })?;
-                    drop(epoch_sender_guard);
-                }
-            }
-
-            let checkpoint_sender_guard = self.checkpoint_sender.lock().await;
-            // NOTE: when the channel is full, checkpoint_sender_guard will wait until the channel has space.
-            // Checkpoints are sent sequentially to stick to the order of checkpoint sequence numbers.
-            for indexed_checkpoint in indexed_checkpoints {
-                checkpoint_sender_guard
-                .send(indexed_checkpoint)
-                .await
-                .map_err(|e| {
-                    error!("Failed to send indexed checkpoint to checkpoint commit handler with error: {}", e.to_string());
-                    IndexerError::MpscChannelError(e.to_string())
-                })?;
-            }
-            drop(checkpoint_sender_guard);
-
-            // NOTE(gegaowp): today ws processing actually will block next checkpoint download,
-            // we can pipeline this as well in the future if needed
-            for checkpoint in &downloaded_checkpoints {
-                let ws_guard = self.metrics.subscription_process_latency.start_timer();
-                for tx in &checkpoint.transactions {
-                    let data: SenderSignedData = bcs::from_bytes(&tx.raw_transaction)?;
-                    self.subscription_handler
-                        .process_tx(data.transaction_data(), &tx.effects, &tx.events)
-                        .await?;
-                }
-                ws_guard.stop_and_record();
             }
         }
     }
@@ -382,9 +312,9 @@ where
                     .await;
                 while let Err(e) = checkpoint_tx_commit_res {
                     warn!(
-                            "Indexer checkpoint & transaction commit failed with error: {:?}, retrying after {:?} milli-secs...",
-                            e, DB_COMMIT_RETRY_INTERVAL_IN_MILLIS
-                        );
+                        "Indexer checkpoint & transaction commit failed with error: {:?}, retrying after {:?} milli-secs...",
+                        e, DB_COMMIT_RETRY_INTERVAL_IN_MILLIS
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(
                         DB_COMMIT_RETRY_INTERVAL_IN_MILLIS,
                     ))
@@ -572,8 +502,137 @@ where
         })
     }
 
+    fn index_packages(
+        transactions: &[CheckpointTransactionBlockResponse],
+        changed_objects: &[(ObjectStatus, SuiObjectData)],
+    ) -> Result<Vec<Package>, IndexerError> {
+        let object_map = changed_objects
+            .iter()
+            .filter_map(|(_, o)| {
+                if let SuiRawData::Package(p) = &o
+                    .bcs
+                    .as_ref()
+                    .expect("Expect the content field to be non-empty from data fetching")
+                {
+                    Some((o.object_id, p))
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        transactions
+            .iter()
+            .flat_map(|tx| {
+                tx.effects.created().iter().map(|oref| {
+                    object_map
+                        .get(&oref.reference.object_id)
+                        .map(|o| Package::try_from(*tx.transaction.data.sender(), o))
+                })
+            })
+            .flatten()
+            .collect()
+    }
+}
+
+struct CheckpointProcessor<S>
+where
+    S: IndexerStore + Clone + Sync + Send + 'static,
+{
+    state: S,
+    metrics: IndexerMetrics,
+    epoch_sender: Arc<Mutex<Sender<TemporaryEpochStore>>>,
+    checkpoint_sender: Arc<Mutex<Sender<TemporaryCheckpointStore>>>,
+    rx: Receiver<CheckpointData>,
+}
+
+impl<S> CheckpointProcessor<S>
+where
+    S: IndexerStore + Clone + Sync + Send + 'static,
+{
+    async fn run(&mut self) -> Result<(), IndexerError> {
+        loop {
+            let checkpoint_data = self
+                .rx
+                .blocking_recv()
+                .expect("Sender of Checkpoint Processor's rx should not be closed.");
+
+            // Index checkpoint data
+            let index_timer = self.metrics.checkpoint_index_latency.start_timer();
+
+            let (checkpoint, epoch) =
+                Self::index_checkpoint_and_epoch(&self.state, &checkpoint_data)
+                    .await
+                    .tap_err(|e| {
+                        error!(
+                            "Failed to index checkpoints {:?} with error: {}",
+                            checkpoint_data,
+                            e.to_string()
+                        );
+                    })?;
+            index_timer.stop_and_record();
+
+            // commit first epoch immediately, send other epochs to channel to be committed later.
+            if let Some(epoch) = epoch {
+                if epoch.last_epoch.is_none() {
+                    let epoch_db_guard = self.metrics.epoch_db_commit_latency.start_timer();
+                    info!("Persisting first epoch...");
+                    let mut persist_first_epoch_res = self.state.persist_epoch(&epoch).await;
+                    while persist_first_epoch_res.is_err() {
+                        warn!("Failed to persist first epoch, retrying...");
+                        persist_first_epoch_res = self.state.persist_epoch(&epoch).await;
+                    }
+                    epoch_db_guard.stop_and_record();
+                    self.metrics.total_epoch_committed.inc();
+                    info!("Persisted first epoch");
+                } else {
+                    let epoch_sender_guard = self.epoch_sender.lock().await;
+                    // NOTE: when the channel is full, epoch_sender_guard will wait until the channel has space.
+                    epoch_sender_guard.send(epoch).await.map_err(|e| {
+                        error!(
+                            "Failed to send indexed epoch to epoch commit handler with error {}",
+                            e.to_string()
+                        );
+                        IndexerError::MpscChannelError(e.to_string())
+                    })?;
+                    drop(epoch_sender_guard);
+                }
+            }
+
+            let checkpoint_sender_guard = self.checkpoint_sender.lock().await;
+            // NOTE: when the channel is full, checkpoint_sender_guard will wait until the channel has space.
+            // Checkpoints are sent sequentially to stick to the order of checkpoint sequence numbers.
+            checkpoint_sender_guard
+                .send(checkpoint)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "checkpoint channel send should not fail, but got error: {:?}",
+                        e
+                    )
+                });
+            drop(checkpoint_sender_guard);
+
+            // NOTE(gegaowp): today ws processing actually will block next checkpoint download,
+            // we can pipeline this as well in the future if needed
+            //
+            // Note: No need to send subscriptions when catching up.
+            // for checkpoint in &downloaded_checkpoints {
+            //     let ws_guard = self.metrics.subscription_process_latency.start_timer();
+            //     for tx in &checkpoint.transactions {
+            //         let data: SenderSignedData = bcs::from_bytes(&tx.raw_transaction)?;
+            //         self.subscription_handler
+            //             .process_tx(data.transaction_data(), &tx.effects, &tx.events)
+            //             .await?;
+            //     }
+            //     ws_guard.stop_and_record();
+            // }
+        }
+    }
+
+    // FIXME read thsi and find bottlenecks
     async fn index_checkpoint_and_epoch(
-        &self,
+        state: &S,
         data: &CheckpointData,
     ) -> Result<(TemporaryCheckpointStore, Option<TemporaryEpochStore>), IndexerError> {
         let CheckpointData {
@@ -637,7 +696,7 @@ where
             .collect();
 
         // Index packages
-        let packages = Self::index_packages(transactions, changed_objects)?;
+        let packages = CheckpointHandler::<S>::index_packages(transactions, changed_objects)?;
 
         // Store input objects, move calls and recipients separately for transaction query indexing.
         let input_objects = transactions
@@ -727,8 +786,7 @@ where
             let event = event.as_ref();
 
             let last_epoch = system_state.epoch as i64 - 1;
-            let network_tx_count_prev_epoch = self
-                .state
+            let network_tx_count_prev_epoch = state
                 .get_network_total_transactions_previous_epoch(last_epoch)
                 .await?;
             Some(TemporaryEpochStore {
@@ -801,38 +859,6 @@ where
             },
             epoch_index,
         ))
-    }
-
-    fn index_packages(
-        transactions: &[CheckpointTransactionBlockResponse],
-        changed_objects: &[(ObjectStatus, SuiObjectData)],
-    ) -> Result<Vec<Package>, IndexerError> {
-        let object_map = changed_objects
-            .iter()
-            .filter_map(|(_, o)| {
-                if let SuiRawData::Package(p) = &o
-                    .bcs
-                    .as_ref()
-                    .expect("Expect the content field to be non-empty from data fetching")
-                {
-                    Some((o.object_id, p))
-                } else {
-                    None
-                }
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        transactions
-            .iter()
-            .flat_map(|tx| {
-                tx.effects.created().iter().map(|oref| {
-                    object_map
-                        .get(&oref.reference.object_id)
-                        .map(|o| Package::try_from(*tx.transaction.data.sender(), o))
-                })
-            })
-            .flatten()
-            .collect()
     }
 }
 
