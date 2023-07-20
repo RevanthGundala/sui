@@ -25,7 +25,16 @@ import { Text } from '_src/ui/app/shared/text';
 
 const numLedgerAccountsToDeriveByDefault = 10;
 
-export function ImportLedgerAccounts() {
+export function ImportLedgerAccounts({
+	onClose,
+	onConfirmed,
+	password,
+}: {
+	onConfirmed?: () => void;
+	onClose?: () => void;
+	// TODO: remove, this is temporary for testing new accounts
+	password?: string;
+}) {
 	const accountsUrl = useNextMenuUrl(true, `/accounts`);
 	const navigate = useNavigate();
 
@@ -47,17 +56,26 @@ export function ImportLedgerAccounts() {
 		},
 		onError: (error) => {
 			toast.error(getSuiApplicationErrorMessage(error) || 'Something went wrong.');
-			navigate(accountsUrl, { replace: true });
+			if (onClose) {
+				onClose();
+			} else {
+				navigate(accountsUrl, { replace: true });
+			}
 		},
 	});
 
 	const importLedgerAccountsMutation = useImportLedgerAccountsMutation({
+		password,
 		onSuccess: (_, importedAccounts) => {
 			ampli.addedAccounts({
 				accountType: 'Ledger',
 				numberOfAccounts: importedAccounts.length,
 			});
-			navigate(accountsUrl);
+			if (onConfirmed) {
+				onConfirmed();
+			} else {
+				navigate(accountsUrl);
+			}
 		},
 		onError: () => {
 			toast.error('There was an issue importing your Ledger accounts.');
@@ -127,7 +145,11 @@ export function ImportLedgerAccounts() {
 			showModal
 			title="Import Accounts"
 			closeOverlay={() => {
-				navigate(accountsUrl);
+				if (onClose) {
+					onClose();
+				} else {
+					navigate(accountsUrl);
+				}
 			}}
 		>
 			<div className="w-full flex flex-col gap-5">
