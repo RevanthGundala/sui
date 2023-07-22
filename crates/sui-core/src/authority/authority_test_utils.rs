@@ -277,6 +277,42 @@ pub fn init_certified_transaction(
     .unwrap()
 }
 
+pub async fn certify_shared_obj_transaction_no_execution(
+    authority: &AuthorityState,
+    transaction: Transaction,
+) -> Result<VerifiedCertificate, SuiError> {
+    let epoch_store = authority.load_epoch_store_one_call_per_task();
+    let transaction = authority.verify_transaction(transaction).unwrap();
+    let response = authority
+        .handle_transaction(&epoch_store, transaction.clone())
+        .await?;
+    let vote = response.status.into_signed_for_testing();
+
+    // Collect signatures from a quorum of authorities
+    let committee = authority.clone_committee_for_testing();
+    let certificate =
+        CertifiedTransaction::new(transaction.into_message(), vec![vote.clone()], &committee)
+            .unwrap()
+            .verify(&committee)
+            .unwrap();
+
+    send_consensus_no_execution(authority, &certificate).await;
+
+    Ok(certificate)
+}
+
+pub async fn execute_sequenced_certificate(
+    authority: &AuthorityState,
+    verified_cert: VerifiedCertificate,
+) {
+    authority
+        .enqueue_certificates_for_execution(
+            vec![verified_cert],
+            &authority.epoch_store_for_testing(),
+        )
+        .unwrap();
+}
+
 pub async fn send_consensus(authority: &AuthorityState, cert: &VerifiedCertificate) {
     let transaction = SequencedConsensusTransaction::new_test(
         ConsensusTransaction::new_certificate_message(&authority.name, cert.clone().into_inner()),
