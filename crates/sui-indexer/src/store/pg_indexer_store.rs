@@ -1248,9 +1248,9 @@ impl PgIndexerStore {
 
     fn persist_checkpoint_transactions(
         &self,
-        checkpoint: &Checkpoint,
+        checkpoints: &[Checkpoint],
         transactions: &[Transaction],
-    ) -> Result<usize, IndexerError> {
+    ) -> Result<(), IndexerError> {
         transactional_blocking!(&self.blocking_cp, |conn| {
             // Commit indexed transactions
             for transaction_chunk in transactions.chunks(PG_COMMIT_CHUNK_SIZE) {
@@ -1270,12 +1270,15 @@ impl PgIndexerStore {
 
             // Commit indexed checkpoint last, so that if the checkpoint is committed,
             // all related data have been committed as well.
-            diesel::insert_into(checkpoints::table)
-                .values(checkpoint)
-                .on_conflict_do_nothing()
-                .execute(conn)
-                .map_err(IndexerError::from)
-                .context("Failed writing checkpoint to PostgresDB")
+            for checkpoint_chunk in checkpoints.chunks(PG_COMMIT_CHUNK_SIZE) {
+                diesel::insert_into(checkpoints::table)
+                    .values(checkpoint_chunk)
+                    .on_conflict_do_nothing()
+                    .execute(conn)
+                    .map_err(IndexerError::from)
+                    .context("Failed writing checkpoint to PostgresDB")?;
+            }
+            Ok::<(), IndexerError>(())
         })
     }
 
@@ -2255,13 +2258,13 @@ impl IndexerStore for PgIndexerStore {
 
     async fn persist_checkpoint_transactions(
         &self,
-        checkpoint: &Checkpoint,
+        checkpoints: &[Checkpoint],
         transactions: &[Transaction],
-    ) -> Result<usize, IndexerError> {
-        let checkpoint = checkpoint.to_owned();
+    ) -> Result<(), IndexerError> {
+        let checkpoints = checkpoints.to_owned();
         let transactions = transactions.to_owned();
         self.spawn_blocking(move |this| {
-            this.persist_checkpoint_transactions(&checkpoint, &transactions)
+            this.persist_checkpoint_transactions(&checkpoints, &transactions)
         })
         .await
     }

@@ -217,9 +217,9 @@ pub trait IndexerStore {
     ) -> Result<usize, IndexerError>;
     async fn persist_checkpoint_transactions(
         &self,
-        checkpoint: &Checkpoint,
+        checkpoints: &[Checkpoint],
         transactions: &[Transaction],
-    ) -> Result<usize, IndexerError>;
+    ) -> Result<(), IndexerError>;
     async fn persist_object_changes(
         &self,
         tx_object_changes: &[TransactionObjectChanges],
