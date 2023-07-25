@@ -37,7 +37,6 @@ export function PageLayout({ gradientContent, content, error }: PageLayoutProps)
 	});
 	const isGradientVisible = !!gradientContent;
 	const isError = !!error;
-	console.log('isError', isGradientVisible, isError);
 
 	return (
 		<div
@@ -78,7 +77,7 @@ export function PageLayout({ gradientContent, content, error }: PageLayoutProps)
 						</div>
 					</section>
 				) : null}
-				<section className="mx-auto max-w-[1440px] px-4 py-6 pb-16 lg:px-6 xl:p-10 xl:pb-16">
+				<section className="mx-auto max-w-[1440px] px-10 py-19 md:py-14 lg:py-17">
 					{content}
 				</section>
 			</main>
